@@ -15,6 +15,24 @@ from filelock import FileLock
 # Override with NANOCHAT_DTYPE env var: "bfloat16", "float16", "float32"
 _DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 def _detect_compute_dtype():
+    """自动检测最优计算精度（compute dtype）。
+
+    返回值: (dtype, reason_str) — dtype 是 torch 的数据类型，reason_str 是人类可读的选择原因说明。
+
+    检测逻辑（优先级从高到低）：
+    1. 环境变量 NANOCHAT_DTYPE — 用户手动指定，直接生效，覆盖自动检测。
+       可选值: "bfloat16"、"float16"、"float32"（由 _DTYPE_MAP 映射到 torch.dtype）
+    2. CUDA GPU 自动检测 — 根据显卡的计算能力（Compute Capability, 即 SM 版本）判断：
+       - SM 8.0+（Ampere 及以后架构，如 A100/A10/4090/H100 等）：选择 bf16
+         bf16 的优势：动态范围与 fp32 相同（8位指数），不容易溢出，
+         且 Ampere+ 的 tensor core 硬件原生支持 bf16 matmul，速度与 fp16 相当。
+       - SM < 8.0（Volta/Turing 等旧架构，如 V100/T4 等）：选择 fp32
+         原因：旧架构没有 bf16 tensor core，bf16 matmul 会退回到慢速的 fp32 软件模拟。
+         fp16 虽然有 tensor core 支持，但需要 GradScaler 处理梯度溢出，
+         项目尚未完整实现 fp16+GradScaler 流程，所以旧 GPU 默认退回 fp32。
+         用户如需 fp16 可手动设置 NANOCHAT_DTYPE=float16。
+    3. 无 CUDA（CPU / MPS）— 选择 fp32，因为 CPU 和 MPS 对低精度 matmul 没有硬件加速。
+    """
     env = os.environ.get("NANOCHAT_DTYPE")
     if env is not None:
         return _DTYPE_MAP[env], f"set via NANOCHAT_DTYPE={env}"

@@ -40,13 +40,32 @@ class GPTConfig:
 
 
 def norm(x):
-    return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
+    # x 的形状为 (B, T, n_embd)，维度 0=B(batch), 1=T(序列长度), 2=n_embd(嵌入维度)
+    # RMSNorm 计算过程（无 learnable 参数，无 bias）:
+    #   1. 对每个向量计算 RMS = sqrt(mean(x_i^2))       — 在最后一个维度 n_embd 上求均值
+    #   2. 输出 = x / RMS                                 — 逐元素除法
+    #   例: x = [3.0, 1.0, 0.0, 2.0]
+    #       mean(x^2) = (9+1+0+4)/4 = 3.5
+    #       RMS = sqrt(3.5) ≈ 1.87
+    #       输出 = [3.0/1.87, 1.0/1.87, 0.0/1.87, 2.0/1.87] ≈ [1.60, 0.53, 0.0, 1.07]
+    #       与 LayerNorm 的区别: LayerNorm 先减均值再除标准差，RMSNorm 不减均值
+    # F.rms_norm(x, (x.size(-1),)) 第二个参数指定归一化的维度形状，这里就是 (n_embd,)
+    # note that this will run in bf16, seems ok
+    return F.rms_norm(x, (x.size(-1),))
 
 class Linear(nn.Linear):
-    """nn.Linear that casts weights to match input dtype in forward.
-    Replaces autocast: master weights stay fp32 for optimizer precision,
-    but matmuls run in the activation dtype (typically bf16 from embeddings)."""
+    """自定义 Linear：forward 时将 weight 临时 cast 到输入 x 的 dtype 来加速矩阵乘法。
+    替代 autocast：master weights 保持 fp32 用于 optimizer 更新精度，
+    但矩阵乘法在激活值的 dtype 下运行。
+
+    x.dtype 由 COMPUTE_DTYPE 决定，分三种情况：
+    - Ampere+ GPU (SM 8.0+):  x.dtype = bf16, weight 临时 cast 到 bf16 → 利用 tensor core 加速
+    - 旧 GPU (SM < 8.0):     x.dtype = fp32, weight 本身就是 fp32, .to() 是无操作 → 纯 fp32 训练
+    - 手动指定 float16:       x.dtype = fp16, weight 临时 cast 到 fp16 → 利用旧 GPU 的 fp16 tensor core（需 GradScaler）"""
     def forward(self, x):
+        # self.weight 本身是 fp32，.to(dtype=x.dtype) 临时转成 x 的 dtype 做矩阵乘法
+        # 具体转成什么取决于 COMPUTE_DTYPE：bf16 / fp16 / fp32（见类 docstring）
+        # .to() 返回新张量，不修改原始 fp32 weight，optimizer 更新时仍用 fp32 保证精度
         return F.linear(x, self.weight.to(dtype=x.dtype))
 
 
