@@ -70,10 +70,64 @@ class Linear(nn.Linear):
 
 
 def has_ve(layer_idx, n_layer):
-    """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
+    """Returns True if GPT layer should have Value Embedding (alternating, last layer always included).
+
+    逻辑: layer_idx 与最后一层 (n_layer-1) 奇偶性相同 → True，不同 → False。
+    效果: 交替分配 VE，且最后一层一定有 VE。
+
+    例1: n_layer=12, 最后一层 index=11(奇数)
+      偶数层(0,2,4,6,8)  → False, 无 VE
+      奇数层(1,3,5,7,9,11) → True,  有 VE  ← 最后一层 11 一定包含
+
+    例2: n_layer=6, 最后一层 index=5(奇数)
+      奇数层(1,3,5) → True, 有 VE
+      偶数层(0,2,4) → False
+
+    例3: n_layer=13, 最后一层 index=12(偶数)
+      偶数层(0,2,4,6,8,10,12) → True, 有 VE  ← 最后一层 12 一定包含
+      奇数层(1,3,5,7,9,11)    → False
+    """
     return layer_idx % 2 == (n_layer - 1) % 2
 
 def apply_rotary_emb(x, cos, sin):
+    """对 Q/K 应用旋转位置编码（Rotary Position Embedding, RoPE）。
+
+    RoPE 的核心思想：通过旋转矩阵让同一位置的两个维度互相混合，
+    使得内积 q·k 中自然包含相对位置信息（位置差 m-n 决定旋转角度差）。
+
+    数学上等价于对每对维度 (x_i, x_{i+d}) 应用 2D 旋转：
+      [cos θ,  sin θ]   [x1]   [x1·cos + x2·sin]
+      [-sin θ, cos θ] × [x2] = [-x1·sin + x2·cos]
+
+    θ 由 token 位置和维度索引决定，不同维度对有不同的频率（低维高频，高维低频）。
+    cos/sin 是向量（长度=D/2），每个维度对有自己的 θ，所以代码中逐元素乘法（element-wise）
+    相当于同时对所有维度对做旋转。
+
+    例: head_dim=4, 位置 pos=1, 序列长度=2 (pos=0 和 pos=1)
+      x (某个 head 的 Q/K 向量) = [1.0, 2.0, 3.0, 4.0]
+        拆分: x1=[1.0, 2.0]  x2=[3.0, 4.0]
+
+      cos/sin 是向量，每个维度对有自己的 θ（频率不同）:
+        维度对0 的 θ₀ = pos × 1/10000^(0/4) = 1.0          → cos₀=0.54, sin₀=0.84  ← 高频，旋转多
+        维度对1 的 θ₁ = pos × 1/10000^(2/4) = 0.01         → cos₁=1.00, sin₁=0.01  ← 低频，几乎不旋转
+
+      所以在 pos=1 时:
+        cos = [0.54, 1.00]   ← 向量，两个维度对的 cos 值不同
+        sin = [0.84, 0.01]   ← 向量，两个维度对的 sin 值不同
+
+      逐元素乘法（每个维度对独立旋转）:
+        y1 = x1 * cos + x2 * sin = [1.0×0.54 + 3.0×0.84,  2.0×1.00 + 4.0×0.01] = [3.06, 2.04]
+        y2 = x1 * (-sin) + x2 * cos = [-1.0×0.84 + 3.0×0.54,  -2.0×0.01 + 4.0×1.00] = [0.78, 3.98]
+
+      对比 pos=0 时（θ=0, cos=[1,1], sin=[0,0], 不旋转）:
+        y1 = x1 * [1,1] + x2 * [0,0] = [1.0, 2.0]  ← 原样不变
+        y2 = x1 * [0,0] + x2 * [1,1] = [3.0, 4.0]  ← 原样不变
+        输出 = [1.0, 2.0, 3.0, 4.0] = x  ← pos=0 不旋转
+
+      pos=1 的输出 = [3.06, 2.04, 0.78, 3.98]  ← 已编码了位置1的信息
+
+    实际形状: x=(B,T,H,D), cos/sin=(1,T,1,D/2), 自动广播到所有 batch 和 head。
+    """
     assert x.ndim == 4  # multihead attention
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:] # split up last dim into two halves
@@ -82,19 +136,32 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 class CausalSelfAttention(nn.Module):
+    """因果自注意力，支持 Grouped-Query Attention (GQA)。
+
+    GQA 核心思想：多个 Q head 共享同一个 K/V head，减少 KV 参数和推理时的 KV cache 内存。
+    三种模式：
+      - MHA: n_kv_head == n_head，每个 Q 有独立的 K/V（标准多头注意力）
+      - GQA: n_kv_head < n_head，多个 Q 共享一个 K/V（折中方案，如 n_head=6, n_kv_head=2）
+      - MQA: n_kv_head == 1，所有 Q 共享一个 K/V（最激进，内存最少但质量略差）
+
+    例: n_head=6, n_kv_head=2:
+      Q heads:  q0  q1  q2  q3  q4  q5    ← 6 个独立的 Q
+      K/V heads: k0/v0          k1/v1      ← 2 个共享的 K/V
+      分组: q0,q1,q2 → k0,v0    q3,q4,q5 → k1,v1
+    """
     def __init__(self, config, layer_idx):
         super().__init__()
         self.layer_idx = layer_idx
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
+        self.n_head = config.n_head          # Q 的头数
+        self.n_kv_head = config.n_kv_head    # K/V 的头数（GQA 时小于 n_head）
         self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
+        self.head_dim = self.n_embd // self.n_head  # 每个头的维度，所有头共用同一个 head_dim
         assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0  # 保证 n_kv_head 能均匀分组
+        self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)       # Q 投影: n_embd → n_head × head_dim = n_embd
+        self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)    # K 投影: n_embd → n_kv_head × head_dim（GQA 时输出更小）
+        self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)    # V 投影: 同 K
+        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)                    # 输出投影: n_embd → n_embd
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
@@ -117,16 +184,33 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
+        # QK norm 后向量被归一化到单位长度，attention logits 会偏小 → softmax 分布偏平坦（接近均匀注意力）。
+        # 乘以 1.2 放大 Q 和 K 的幅度，使 attention logits 变大 → softmax 分布更尖锐（更集中在重要 token）。
+        # 注意力得分 = Q·K^T，Q 和 K 都乘 1.2 → 总缩放 = 1.2² = 1.44。
+        # "split scale between Q and K": 把 1.44 的缩放拆分到 Q 和 K 各乘 1.2，而不是只对其中一个乘 1.44，
+        # 这样 Q 和 K 的幅度保持对称，数值更稳定。
+        # TODO: 1.2 是经验值，最优值还需进一步验证。
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2
 
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
+        #
+        # 训练 vs 推理的 attention 计算方式不同：
+        #   训练: 整个序列一次性处理，所有 token 的 K/V 同时计算，不需要缓存。
+        #         输入 (B, T) 序列，K/V 形状为 (B, T, n_kv_head, head_dim)，包含所有位置的 K/V。
+        #         每步计算量 O(T²)，但一次完成，无重复计算。
+        #   推理: 自回归逐 token 生成，每步只输入 1 个新 token (B, 1)。
+        #         如果每步都重算之前所有 token 的 K/V → 重复计算，极度浪费。
+        #         kv_cache 把历史 K/V 存下来，新 token 只算自己的 K/V 然后拼到 cache 里。
+        #         每步计算量 O(T)（T 为当前序列长度），但避免了重算历史 K/V。
+        #         推理调用链: GPT.generate() → GPT.forward(idx, kv_cache=kv_cache_obj)
+        #         训练调用链: train loop → GPT.forward(idx, targets=targets) → kv_cache=None（默认值）
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
+            # Training: 整个序列的 K/V 同时计算，causal attention with optional sliding window
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
-            # Inference: use flash_attn_with_kvcache which handles cache management
+            # Inference: 从 cache 读取历史 K/V，只新算当前 token 的 K/V，拼入 cache
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = flash_attn.flash_attn_with_kvcache(
                 q, k_cache, v_cache,
