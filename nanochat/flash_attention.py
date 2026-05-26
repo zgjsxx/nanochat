@@ -65,6 +65,12 @@ USE_FA3 = _resolve_use_fa3()
 
 # =============================================================================
 # SDPA helpers
+# SDPA = Scaled Dot-Product Attention，即标准注意力: softmax(Q·K^T / sqrt(d_k)) · V
+# - Scaled: 注意力得分除以 sqrt(d_k)，防止维度大时 softmax 梯度消失
+# - Dot-Product: 用 Q·K^T（点积）计算注意力得分
+# - Attention: 注意力机制
+# 对应 PyTorch 内置函数 F.scaled_dot_product_attention()，是 PyTorch 2.0+ 的融合注意力实现。
+# 在本项目中作为 FA3 的 fallback：FA3 仅支持 Hopper GPU(SM 9.0)，SDPA 支持所有 GPU。
 # =============================================================================
 def _sdpa_attention(q, k, v, window_size, enable_gqa):
     """
