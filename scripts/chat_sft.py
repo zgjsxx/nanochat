@@ -286,6 +286,13 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         # Build tensors
         use_cuda = device_type == "cuda"
         batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
+        # Next-token prediction 的标准做法：inputs 是 token 0~N-1，targets 是 token 1~N
+        # 即每个 input token 的"目标"是它后面的下一个 token
+        # 例: batch_tensor = [BOS, user_start, "1", "+", "1", user_end, asst_start, "=", "2", asst_end]
+        #     inputs  = [BOS, user_start, "1", "+", "1", user_end, asst_start, "=", "2"]       ← 去掉最后一个
+        #     targets = [user_start, "1", "+", "1", user_end, asst_start, "=", "2", asst_end]  ← 去掉第一个，左移1位
+        #     模型看到 BOS → 应预测 user_start；看到 "1" → 应预测 "+"；看到 "=" → 应预测 "2"
+        # inputs 用 int32（节省显存，embedding 层内部会处理），targets 用 int64（cross_entropy 要求）
         inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_cuda).contiguous()
         targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda).contiguous()
 
