@@ -77,34 +77,59 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     SDPA attention with sliding window support.
     q, k, v are (B, H, T, D) format.
     """
-    Tq = q.size(2)
-    Tk = k.size(2)
-    window = window_size[0]
+    Tq = q.size(2)  # query 的序列长度，维度索引 2 = T（如训练时 Tq=2048，推理时 Tq=1）
+    Tk = k.size(2)  # key 的序列长度，训练时 Tk=Tq，推理时 Tk=已缓存的历史长度
+    window = window_size[0]  # window_size 是 (left, right) 元组，[0] 取左侧窗口大小；-1 表示无限（full context）
 
-    # Full context, same length
+    # Full context, same length — 最简单的场景：标准训练时的 causal attention
+    # 条件1: window < 0 或 window >= Tq → 窗口为无限或大于序列长度，等于没有滑动窗口限制
+    # 条件2: Tq == Tk → query 和 key 长度相同，即训练时整个序列一起计算
+    # 两个条件同时满足 → 直接用标准 causal SDPA，无需额外 mask
     if (window < 0 or window >= Tq) and Tq == Tk:
         return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
 
-    # Single token generation
+    # Single token generation — 推理时逐 token 生成，Tq=1（只有 1 个新 query token）
+    # 此时 Tq != Tk（Tk 是已缓存的历史长度），不能用 is_causal，需要显式处理窗口
     if Tq == 1:
+        # 如果窗口有限且小于已缓存长度，只取最近 window+1 个 key/value（滑动窗口裁剪）
         if window >= 0 and window < Tk:
             # window is "left" tokens we need to include (window + 1) keys total
             start = max(0, Tk - (window + 1))
             k = k[:, :, start:, :]
             v = v[:, :, start:, :]
+        # is_causal=False: 单 token 对完整历史不需要 causal mask（历史 key 本身就按时间排列）
         return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
 
-    # Need explicit mask for sliding window/chunk inference
+    # Need explicit mask for sliding window/chunk inference — 最复杂的场景
+    # 场景: Tq > 1 且 Tq != Tk（prefill 推理: 输入一段新 token，对已有 cache 做 attention）
+    # 此时不能用 is_causal=True（因为 cache 前面已有历史 token，causal mask 的对齐位置不对）
+    # 也不能走上面 Tq==1 的简单路径（因为 Tq > 1，有多个新 query token 之间也有 causal 关系）
+    # 所以需要手动构建一个 bool mask 来同时处理 causal + 滑动窗口
+    #
+    # 维度理解: 进入 _sdpa_attention() 时，q 只有新来的 Tq 个 token，而 k/v 是完整的 Tk 个 token
+    #   q.shape = (B, H, Tq, D)       ← 例如 (B, H, 5, D)
+    #   k.shape = (B, H, Tk, D)       ← 例如 (B, H, 1005, D)，包含历史cache+新插入
+    #   v.shape = (B, H, Tk, D)       ← 同上
+    #   attention score = q @ k^T → 形状 (Tq, Tk)，即 (5, 1005)
+    #   因此 mask.shape 也必须是 (Tq, Tk) = (5, 1005)，和 attention score 对齐
     device = q.device
-    # For chunk inference (Tq != Tk), is_causal is not aligned to cache position => build an explicit bool mask
+    # row_idx 是每个 query token 在完整序列中的绝对位置（偏移 Tk-Tq 是因为前面已有 Tk-Tq 个历史 token）
+    # 例: cache 已有 1000 个 token，新输入 5 个 token → row_idx = [1000, 1001, 1002, 1003, 1004]
     row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)
+    # col_idx 是每个 key token 的绝对位置
+    # 例: Tk=1005 → col_idx = [0, 1, 2, ..., 1004]
     col_idx = torch.arange(Tk, device=device).unsqueeze(0)
+    # causal mask: key 的位置必须 <= query 的位置（不能"看到未来"）
+    # 例: row_idx=1001, col_idx=500 → 500<=1001 ✓ 可以 attend
+    #     row_idx=1001, col_idx=1002 → 1002<=1001 ✗ 不能 attend（未来的 token）
     mask = col_idx <= row_idx
 
-    # sliding window (left)
+    # sliding window (left): query 只能 attend 到距离不超过 window 的 key
+    # 例: window=512, row_idx=1001 → 只能 attend 到 col_idx >= 1001-512=489 的 key
     if window >= 0 and window < Tk:
         mask = mask & ((row_idx - col_idx) <= window)
 
+    # 最终 mask 同时满足 causal + sliding window 两个条件
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
 
 # =============================================================================
