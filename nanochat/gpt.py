@@ -266,8 +266,10 @@ class GPT(nn.Module):
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
-        # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
-        # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
+        # 将 vocab_size 向上取整到 pad_vocab_size_to(64) 的倍数，纯粹是效率优化，不影响模型行为
+        # 原因：GPU Tensor Core 要求维度是 64 的倍数才能高效运算；DDP 分布式训练也需要 vocab 维度对齐
+        # ((x + n - 1) // n) * n 等价于 ceil(x / n) * n 的纯整数写法，向上取整到 n 的倍数
+        # 输出的 logits 会切片回原始 vocab_size，所以 padding 对模型行为无影响
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
@@ -394,8 +396,12 @@ class GPT(nn.Module):
         pattern = config.window_pattern.upper()
         assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
         # Map characters to window sizes
+        # long_window: 完整上下文长度（全注意力窗口）
         long_window = config.sequence_len
-        short_window = -(-long_window // 4 // 128) * 128  # ceil to FA3 tile size (2048 -> 768)
+        # short_window: 1/4 上下文长度（滑动窗口），向上取整到 128 的倍数（FA3 tile size 要求）
+        # -(-a // b) 等价于 ceil(a / b) 的纯整数写法：先取反让 floor 变成 ceil，再取反还原符号
+        # 例：sequence_len=2048 → 2048//4=512 → -(-512//128)*128 = 4*128 = 512
+        short_window = -(-long_window // 4 // 128) * 128
         char_to_window = {
             "L": (long_window, 0),
             "S": (short_window, 0),
@@ -547,11 +553,14 @@ class GPT(nn.Module):
                 x = x + gate * x_pre_smear
 
         # Forward the trunk of the Transformer
-        x0 = x  # save initial normalized embedding for x0 residual
+        x0 = x  # 保存初始嵌入，全程不变，作为每层的"记忆锚点"
         n_layer = self.config.n_layer
-        backout_layer = n_layer // 2  # cache at halfway point
+        backout_layer = n_layer // 2  # 在中间层缓存残差，用于最终去除低层特征
         x_backout = None
         for i, block in enumerate(self.transformer.h):
+            # 残流调节：x 逐层更新，x0 是原始嵌入（不变）
+            # resid_lambdas[i] 缩放当前残差流幅度，防止深层残差爆炸/衰减
+            # x0_lambdas[i] 把原始嵌入回混到每层，让深层也能"回头看"初始 token 信息
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
